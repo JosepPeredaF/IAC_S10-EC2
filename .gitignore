@@ -1,3 +1,5 @@
 .terraform/
 terraform.tfvars
 iac/.terraform.lock.hcl
+*.tfstate
+*.tfstate.*

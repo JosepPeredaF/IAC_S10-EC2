@@ -1,0 +1,73 @@
+#!/bin/bash
+dnf install -y python3-boto3 amazon-cloudwatch-agent
+
+mkdir -p /opt/worker
+cat > /opt/worker/worker.py <<'PY'
+import boto3, json, socket, time
+
+sqs = boto3.client("sqs", region_name="${region}")
+URL = "${queue_url}"
+host = socket.gethostname()
+print(f"worker iniciado en {host}", flush=True)
+
+while True:
+    resp = sqs.receive_message(QueueUrl=URL, MaxNumberOfMessages=10, WaitTimeSeconds=10)
+    msgs = resp.get("Messages", [])
+    if not msgs:
+        continue
+    ok = 0
+    for m in msgs:
+        try:
+            d = json.loads(m["Body"])
+            time.sleep(0.5)  # simula el trabajo de procesar la ubicacion
+            print(json.dumps({"host": host, "conductor_id": d["conductor_id"], "lat": d["lat"], "lon": d["lon"]}), flush=True)
+            ok += 1
+        except Exception as e:
+            print(f"ERROR mensaje {m['MessageId']}: {e}", flush=True)
+        sqs.delete_message(QueueUrl=URL, ReceiptHandle=m["ReceiptHandle"])
+    print(json.dumps({"resumen": {"host": host, "recibidos": len(msgs), "procesados": ok}}), flush=True)
+PY
+
+cat > /etc/systemd/system/worker.service <<'EOF'
+[Unit]
+Description=Worker SQS
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/python3 -u /opt/worker/worker.py
+Restart=always
+StandardOutput=append:/var/log/worker.log
+StandardError=append:/var/log/worker.log
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+cat > /opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json <<'EOF'
+{
+  "agent": { "metrics_collection_interval": 60 },
+  "metrics": {
+    "namespace": "Workers",
+    "append_dimensions": { "InstanceId": "$${aws:InstanceId}" },
+    "metrics_collected": { "mem": { "measurement": ["mem_used_percent"] } }
+  },
+  "logs": {
+    "logs_collected": {
+      "files": {
+        "collect_list": [
+          {
+            "file_path": "/var/log/worker.log",
+            "log_group_name": "/${project_name}/worker",
+            "log_stream_name": "{instance_id}"
+          }
+        ]
+      }
+    }
+  }
+}
+EOF
+
+/opt/aws/amazon-cloudwatch-agent/bin/amazon-cloudwatch-agent-ctl -a fetch-config -m ec2 -s -c file:/opt/aws/amazon-cloudwatch-agent/etc/amazon-cloudwatch-agent.json
+
+systemctl daemon-reload
+systemctl enable --now worker
